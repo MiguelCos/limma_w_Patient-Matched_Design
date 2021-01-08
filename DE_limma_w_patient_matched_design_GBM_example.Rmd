@@ -1,0 +1,343 @@
+---
+title: "Limma DE analysis - GBM data - Including patient random effect"
+author: "Miguel Cosenza"
+date: "1/8/2021"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```  
+
+#### *Required packages*
+
+```{r}
+library(tidyverse)
+library(ggrepel)
+library(limma)
+library(kableExtra)
+```
+
+# Limma Differential expression analysis of GBM cancer data, including the random effect of patient in the design matrix  
+
+The objective of this study is to identify protein signatures associated with recurrent or primary tumor. In one sentence, we want answer: __What is the difference in terms of protein expression between recurrent and primary GBM tumors?__
+
+Glioblastoma tumors are of highly heterogeneous nature. This implies an important inter-patient variability that make it difficult to test for differences in tumor tissue without accounting for the patient effect. Including the random patient effect in the general linear model, applied by the protein-wise via `limma` analysis, allows for the evaluation of the the specific effect of the tumor stage.  
+
+Samples from 11 patients were obtained at the two different stages (primary and recurrent). 1 patient (patient 6) was excluded from the analysis because unsupervised/exploratory analysis pointed it as an outlier. It was assumed as a sample processing error.  
+
+The experimental design was set up in a patient-matched manner, in order to control for the random effect between patients while exploring the differences of interest between recurrent and primary tumor. 
+
+### Load and format data 
+
+We load the data and exclude patient 6. The sample names are defined as `N.stage`, where `N` is the patient number and `stage` is either `primary` or `recurrent` tumor. Then transform the expression dataset into a matrix object in R.  
+
+```{r}
+# Load and format GBM dataset 
+exprdata <- read.table("Data/input_limma_nofilter_NOmissing.txt", sep="\t", header=TRUE)
+exprdata <- dplyr::select(exprdata, -c(X6.prim, X6.rec)) %>% 
+                    na.omit() # remove all proteins with NAs
+
+colnames(exprdata)<- c("Protein",substr(colnames(exprdata[2:length(exprdata)]),2,8))
+
+exprdata <- exprdata[
+                    ,c("Protein","1.prim","2.prim","3.prim","4.prim","5.prim","7.prim","8.prim","9.prim","10.prim","11.prim",
+                       "1.rec","2.rec","3.rec","4.rec","5.rec","7.rec","8.rec","9.rec","10.rec","11.rec")]
+
+matexpr <- dplyr::select(exprdata,
+                         -Protein) 
+row.names(matexpr) <- exprdata$Protein
+
+quant.df <- as.matrix(matexpr)
+```
+
+## Setting up the design matrix for `limma`  
+
+Design matrices are the way to tell R, and this case `limma`, what's our experimental design and how to compare the groups we have in our data.  
+
+If we look at our data, we have two factors: `patient` and `stage`, from which we are interested on `stage`. Nevertheless, we should take into account the effect on the variance due to inter-patient variability. We do that by setting up the appropriate design matrix.  
+
+If we take a look at our samples names from the expression dataset, they look like this:  
+
+```{r}
+samples <- names(exprdata)[-1]
+print(samples)
+```
+
+From that we can extract the information we need to set up the apropriate design matrix. We use the "." separator to create our two factors/variables of interest: `patient` and `tumor`, this last one reffering to tumor stage.
+
+```{r}
+split1 <- str_split_fixed(samples, pattern = "\\.", n = 2)
+
+patient <- split1[,1]
+tumor <- split1[,2]
+```
+
+Checking the `patient` factor, we see a characted vector that assigns a number to each patient in the study. As observed, the numbers are repeated twice, because for each patient we have two tumor stages (`primary` and `recurrent`).
+
+```{r}
+patient
+```
+ 
+ We can have a similar observation by checking the `tumor` factor. We see a characted vector that allows to separate the patient samples into `primary` and `recurrent` tumor. 
+ 
+```{r}
+tumor
+```
+
+Then we can create the design matrix that would serve for answering our biostatistical question, using the `model.matrix()` function and our two factors of interest as an input.  
+
+```{r}
+design_limma <- model.matrix(~patient+tumor)
+```
+
+Just for comparison, let's create a _simple_ design matrix, which would not include the patient random effect in the model.  
+
+```{r}
+design_tumor <- model.matrix(~tumor)
+```
+
+#### Let's see how the design matrices looks and try to interpret them in the context of our current dataset and biological question  
+
+- __Design matrix with patient random effect__  
+
+```{r}
+design_limma
+```  
+
+What we see is a matrix with 20 rows and 11 columns.  
+
+Each row corresponds to a sample from our expression dataset. Each column corresponds to a coefficient, as it would be interpreted when used as input in the general linear model which is applied by `limma` on each protein/gene. The matrix is filled with `0`s and `1`s. We should interpret the presence of a `1` as _switching on_ the 'identity' of a sample towards the coefficient on which the `1`is appearing.  
+
+For example: checking row 12, we see a `1` on the coefficient `patient2` and on the coefficient `tumorrec`. This is telling the `limma`-fitted model: "the __column 12__ in the expression dataset, corresponds to `patient 2` and `recurrent` tumor.  
+
+Here, since we included both `stage` and `patient` effects in the models, we have coefficients for both factors.
+
+Notice that we have 9 coefficients for patients and 1 coefficient for the type of tumor. This is because the model is set up to work against a reference level. For `stage` our reference level is `tumorprimary` and for `patient`, the reference level is `patient1`. We don't see those in the matrix because they are represented by the intercept column.  
+
+Also notice that the __rows__ of your design matrix should exactly correspond to the __column__ names in your original expression matrix (excluding the column containing the protein names, of course). Checking this is a good way to see if you are actually comparing what you want to compare or if the labels were mixed up somehow.  
+
+Let us see how the 'simple' design matrix looks like (the one that doesn't include the `patient` coefficients).
+
+- __Design matrix without the patient random effect__  
+
+```{r}
+design_tumor
+```
+
+In this case, it is only separating the dataset into `recurrent` vs `primary`. We will see that, in the context of this study, the detection of proteomic differences using this simple design is a lot less sensitive.  
+
+## Fitting the generalized linear model using `limma`  
+
+Then we can fit the model using the `lmFit` function from `limma`.
+
+Here we will fit the two models with the different design matrices to illustrate the difference in the results.  
+
+### Including the random patient effect (patient-matched/sample-matched design)  
+
+We set the method to `robust`, which forces the application of a robust regression for the linear model. This type of regression is 'resistant' to outliers and therefore is very useful when working with heterogeneous data. 
+
+The tabular results are extracted with the `topTable` function and setting the `coef` argument as the name of the coefficient on which we are interested to check.  
+
+In this case, we want to check differences between `recurrent` and `primary`, which are evaluated by the `tumorrec` coefficient.  
+
+The differences between tumor stages are, at this point, already corrected for the patient effect.  
+
+```{r message=FALSE, warning=FALSE}
+fit_matched <- lmFit(quant.df, # expression matrix
+                     design = design_limma, # design matrix
+                     method = "robust") # set to robust regression  
+fit_matched <- eBayes(fit_matched)
+
+fit_matched_tab <- topTable(fit_matched, 
+                            coef = "tumorrec", 
+                            number = Inf, 
+                            adjust.method = "BH") %>% # FDR correction of DE analysis happens here
+  mutate(Protein = rownames(.), # include the Protein IDs as a column
+         Model = "Robust - w Patient effect") # just adding a column indicating which model was applied.
+
+```
+In this case, `fit_matched_tab` is a table with the summarized results of the differential expression analysis after `limma`, with adjusted and non-adjusted p-values, proteins and fold-changes.  
+
+#### Tabular output of the differentially expressed proteins after Robust `limma` including the random effect by patient in the model.  
+
+```{r}
+kableExtra::kbl(fit_matched_tab %>% filter(adj.P.Val <= 0.05)) %>%
+  kableExtra::kable_paper("hover") %>%
+  kableExtra::scroll_box(width = "100%", height = "450px")
+```
+
+### Without including the random patient effect ('simple' design)  
+
+Let's see what happens when we don't include the patient random effect in the model. We repeat the same procedure as above, but changing the design matrix.  
+
+```{r message=FALSE, warning=FALSE}
+fit_simple <- lmFit(quant.df, # expression matrix
+                     design = design_tumor, # design matrix
+                     method = "robust") # set to robust regression  
+fit_simple <- eBayes(fit_simple)
+
+fit_simple_tab <- topTable(fit_simple, 
+                            coef = "tumorrec", 
+                            number = Inf, 
+                            adjust.method = "BH") %>% # FDR correction of DE analysis happens here
+  mutate(Protein = rownames(.), # include the Protein IDs as a column
+         Model = "Robust - without Patient effect") # just adding a column indicating which model was applied.
+
+```
+
+#### Tabular output of the differentially expressed proteins after Robust `limma` including the random effect by patient in the model.  
+
+```{r}
+kableExtra::kbl(fit_simple_tab %>% filter(adj.P.Val <= 0.05)) %>%
+  kableExtra::kable_paper("hover") %>%
+  kableExtra::scroll_box(width = "100%", height = "250px")
+```  
+
+
+### Volcano plots of the DE analyses with the different design matrices  
+
+```{r}
+both_outputs <- bind_rows(fit_matched_tab, fit_simple_tab) # bind limma tabular outputs  
+
+unip2symbol <- clusterProfiler::bitr(both_outputs$Protein,fromType = "UNIPROT", toType = "SYMBOL",
+                                     OrgDb = "org.Hs.eg.db", drop = FALSE) %>% 
+                    dplyr::rename(Protein = UNIPROT)
+
+both_outputs <- left_join(both_outputs, unip2symbol, by = "Protein")
+
+
+volcano_plots <- function(limma_out){ # create a function to plot the volcano plots and facet by model
+  limma_volc1 <- ggplot(data = limma_out, mapping = aes(x = logFC, y = -log10(adj.P.Val), label = SYMBOL)) +
+  geom_point()+
+  geom_point(data = filter(limma_out, logFC > 0, adj.P.Val <= 0.05), mapping = aes(x = logFC, y = -log10(adj.P.Val)),
+             color = "red")+
+  geom_point(data = filter(limma_out, logFC < 0, adj.P.Val <= 0.05), mapping = aes(x = logFC, y = -log10(adj.P.Val)),
+             color = "blue")+
+  ggrepel::geom_text_repel(data = group_by(limma_out, Model) %>% slice_max(-adj.P.Val, n = 15),
+                           aes(label = SYMBOL)) + 
+  facet_wrap(.~ Model)
+  
+  return(limma_volc1)
+}
+
+limma_volc1 <- volcano_plots(both_outputs) + ggtitle("Limma DEA results using 2 different models",
+                                                   subtitle = "Colored dots represent differentially expressed proteins")
+
+
+```
+```{r}
+limma_volc1
+```   
+
+
+ The model including the patient random effect is a lot more sensitive.  
+
+## Negative control of the models using a randomized dataset  
+
+A randomized expression matrix was created from the original dataset by randomly sampling values from both rows and columns, creating a 'shuffled expression matrix, with the same rows and column names, but randomized values for both rows and columns.  
+
+```{r}
+shuffle_matrix <- function(mat, seed){ # function for shuffling expression values
+
+  set.seed(seed = seed)
+  for (i in 1:nrow(mat)){ # shuffle row-wise
+  mat[i,] <- sample(mat[i,], size = ncol(mat), replace = FALSE)
+  }
+  
+  for (i in 1:ncol(mat)){ # shuffle column-wise
+    mat[,i] <- sample(mat[,i], size = nrow(mat), replace = FALSE)
+  }
+  
+  return(mat)
+}
+
+shuffled_exprmat <- shuffle_matrix(quant.df, seed = 2007) 
+```
+
+#### **Original expression matrix**  
+
+```{r}
+print(quant.df[1:6, 1:8])
+```
+
+#### **'Shuffled' expression matrix**  
+
+```{r}
+print(shuffled_exprmat[1:6, 1:8])
+``` 
+
+### Fit the linear models with both design matrices  
+
+#### With patient matched design  
+
+```{r}
+fit_shmatched <- lmFit(shuffled_exprmat, # expression matrix
+                     design = design_limma, # design matrix
+                     method = "robust") # set to robust regression  
+fit_shmatched <- eBayes(fit_shmatched)
+
+fit_shmatched_tab <- topTable(fit_shmatched, 
+                            coef = "tumorrec", 
+                            number = Inf, 
+                            adjust.method = "BH") %>% # FDR correction of DE analysis happens here
+  mutate(Protein = rownames(.), # include the Protein IDs as a column
+         Model = "Robust - w Patient effect") # just adding a column indicating which model was applied.
+
+```
+
+##### Tabular output  
+
+```{r}
+kableExtra::kbl(fit_shmatched_tab %>% filter(adj.P.Val <= 0.05)) %>%
+  kableExtra::kable_paper("hover") %>%
+  kableExtra::scroll_box(width = "100%", height = "450px")
+``` 
+
+#### Without patient matched design  
+
+```{r message=FALSE, warning=FALSE}
+fit_shsimple <- lmFit(shuffled_exprmat, # expression matrix
+                     design = design_tumor, # design matrix
+                     method = "robust") # set to robust regression  
+fit_shsimple <- eBayes(fit_shsimple)
+
+fit_shsimple_tab <- topTable(fit_shsimple, 
+                            coef = "tumorrec", 
+                            number = Inf, 
+                            adjust.method = "BH") %>% # FDR correction of DE analysis happens here
+  mutate(Protein = rownames(.), # include the Protein IDs as a column
+         Model = "Robust - without Patient effect") # just adding a column indicating which model was applied.
+
+```
+
+##### Tabular output  
+
+```{r}
+kableExtra::kbl(fit_shsimple_tab %>% filter(adj.P.Val <= 0.05)) %>%
+  kableExtra::kable_paper("hover") %>%
+  kableExtra::scroll_box(width = "100%", height = "250px")
+``` 
+ 
+```{r}
+both_shoutputs <- bind_rows(fit_shmatched_tab, fit_shsimple_tab) # bind limma tabular outputs  
+
+unip2symbol <- clusterProfiler::bitr(both_shoutputs$Protein,fromType = "UNIPROT", toType = "SYMBOL",
+                                     OrgDb = "org.Hs.eg.db", drop = FALSE) %>% 
+                    dplyr::rename(Protein = UNIPROT)
+
+both_shoutputs <- left_join(both_shoutputs, unip2symbol, by = "Protein")
+```
+
+### Volcano plots of the DE analyses with the different design matrices on the shuffled dataset (negative control)  
+
+```{r}
+limma_volcshuf <- volcano_plots(both_shoutputs) + ggtitle("Limma DEA results using 2 different models - Shuffled dataset - Negative control",
+                                                   subtitle = "Colored dots represent differentially expressed proteins")
+```
+
+```{r}
+limma_volcshuf
+```  
+
+The top 15 hits with the lowers adjusted p-values are completely different when using the shuffled data set.
