@@ -2,7 +2,9 @@
 title: "Limma DE analysis - GBM data - Including patient random effect"
 author: "Miguel Cosenza"
 date: "1/8/2021"
-output: github_document
+output:
+  github_document:
+    html_preview: false
 ---
 
 ```{r setup, include=FALSE}
